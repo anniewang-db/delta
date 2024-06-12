@@ -16,19 +16,31 @@
 
 package org.apache.spark.sql.delta.hudi
 
-import org.apache.avro.Schema
+import java.io.{IOException, UncheckedIOException}
+import java.time.{Instant, LocalDateTime, ZoneId}
+import java.time.format.{DateTimeFormatterBuilder, DateTimeParseException}
+import java.time.temporal.{ChronoField, ChronoUnit}
+import java.util
+import java.util.{Collections, Properties}
+import java.util.stream.Collectors
 
+import scala.collection.JavaConverters._
+import scala.collection.mutable._
 import scala.util.control.NonFatal
-import org.apache.spark.sql.delta.Snapshot
+
+import org.apache.avro.Schema
+import org.apache.commons.lang3.exception.ExceptionUtils
+import org.apache.hadoop.conf.Configuration
+
 import org.apache.spark.sql.delta.actions.Action
 import org.apache.spark.sql.delta.hudi.HudiSchemaUtils._
 import org.apache.spark.sql.delta.hudi.HudiTransactionUtils._
+import org.apache.spark.sql.delta.Snapshot
 import org.apache.spark.sql.delta.metering.DeltaLogging
-import org.apache.commons.lang3.exception.ExceptionUtils
-import org.apache.hadoop.conf.Configuration
 import org.apache.hudi.avro.model.HoodieActionInstant
-import org.apache.hudi.avro.model.HoodieCleanFileInfo
+import org.apache.hudi.avro.model.HoodieActionInstant
 import org.apache.hudi.avro.model.HoodieCleanerPlan
+import org.apache.hudi.avro.model.HoodieCleanFileInfo
 import org.apache.hudi.client.HoodieJavaWriteClient
 import org.apache.hudi.client.HoodieTimelineArchiver
 import org.apache.hudi.client.WriteStatus
@@ -41,9 +53,9 @@ import org.apache.hudi.common.table.HoodieTableMetaClient
 import org.apache.hudi.common.table.timeline.{HoodieInstant, HoodieInstantTimeGenerator, HoodieTimeline, TimelineMetadataUtils}
 import org.apache.hudi.common.table.timeline.HoodieInstantTimeGenerator.{MILLIS_INSTANT_TIMESTAMP_FORMAT_LENGTH, SECS_INSTANT_ID_LENGTH, SECS_INSTANT_TIMESTAMP_FORMAT}
 import org.apache.hudi.common.util.CleanerUtils
+import org.apache.hudi.common.util.collection.Pair
 import org.apache.hudi.common.util.ExternalFilePathUtil
 import org.apache.hudi.common.util.{Option => HudiOption}
-import org.apache.hudi.common.util.collection.Pair
 import org.apache.hudi.config.HoodieArchivalConfig
 import org.apache.hudi.config.HoodieCleanConfig
 import org.apache.hudi.config.HoodieIndexConfig
@@ -51,16 +63,6 @@ import org.apache.hudi.config.HoodieWriteConfig
 import org.apache.hudi.index.HoodieIndex.IndexType.INMEMORY
 import org.apache.hudi.table.HoodieJavaTable
 import org.apache.hudi.table.action.clean.CleanPlanner
-
-import java.io.{IOException, UncheckedIOException}
-import java.time.{Instant, LocalDateTime, ZoneId}
-import java.time.format.{DateTimeFormatterBuilder, DateTimeParseException}
-import java.time.temporal.{ChronoField, ChronoUnit}
-import java.util
-import java.util.stream.Collectors
-import java.util.{Collections, Properties}
-import collection.mutable._
-import scala.collection.JavaConverters._
 
 /**
  * Used to prepare (convert) and then commit a set of Delta actions into the Hudi table located
@@ -125,7 +127,7 @@ class HudiConversionTransaction(
   def commit(): Unit = {
     assert(!committed, "Cannot commit. Transaction already committed.")
     val writeConfig = getWriteConfig(hudiSchema, getNumInstantsToRetain, 10, 7*24)
-    val engineContext: HoodieEngineContext = new HoodieJavaEngineContext(metaClient.getHadoopConf)
+    val engineContext: HoodieEngineContext = new HoodieJavaEngineContext(metaClient.getStorageConf)
     val writeClient = new HoodieJavaWriteClient[AnyRef](engineContext, writeConfig)
     try {
       writeClient.startCommitWithTime(instantTime, HoodieTimeline.REPLACE_COMMIT_ACTION)
@@ -226,10 +228,11 @@ class HudiConversionTransaction(
             earliestInstantToRetain.getAction,
             earliestInstantToRetain.getState.name))
         .orElse(null)
+      val emptyCleanerPlanExtraMetadata = new java.util.HashMap[String, String]()
       val cleanerPlan = new HoodieCleanerPlan(earliestInstantToRetain, instantTime,
         writeConfig.getCleanerPolicy.name, Collections.emptyMap[String, util.List[String]],
         CleanPlanner.LATEST_CLEAN_PLAN_VERSION, cleanInfoPerPartition,
-        Collections.emptyList[String])
+        Collections.emptyList[String], emptyCleanerPlanExtraMetadata)
       // create a clean instant and mark it as requested with the clean plan
       val requestedCleanInstant = new HoodieInstant(HoodieInstant.State.REQUESTED,
         HoodieTimeline.CLEAN_ACTION, cleanTime)
@@ -243,8 +246,9 @@ class HudiConversionTransaction(
         new HoodieCleanStat(HoodieCleaningPolicy.KEEP_LATEST_COMMITS, partitionPath, deletePaths,
           deletePaths, Collections.emptyList[String], earliestInstant.get.getTimestamp, instantTime)
       }).toSeq.asJava
+      val emptyExtraMetadata = new java.util.HashMap[String, String]()
       val cleanMetadata =
-        CleanerUtils.convertCleanMetadata(cleanTime, HudiOption.empty[java.lang.Long], cleanStats)
+        CleanerUtils.convertCleanMetadata(cleanTime, HudiOption.empty[java.lang.Long], cleanStats, emptyExtraMetadata)
       // update the metadata table with the clean metadata so the files' metadata are marked for
       // deletion
       hoodieTableMetadataWriter.performTableServices(HudiOption.empty[String])
